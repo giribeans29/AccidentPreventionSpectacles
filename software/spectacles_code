@@ -1,0 +1,193 @@
+#include <Wire.h>
+#include <MPU6050.h>
+#include <esp_now.h>
+#include <WiFi.h>
+#include <esp_wifi.h>
+
+#define IR_PIN 3
+#define TOUCH_PIN 7
+#define LED_PIN 8
+#define BUZZER_PIN 4
+#define VIB_PIN 10
+
+MPU6050 mpu;
+
+// ===== SENSOR FLAGS =====
+bool mpuDrowsy = false;
+bool irDrowsy = false;
+
+unsigned long eyeCloseStart = 0;
+
+// ===== VIBRATION CONTROL =====
+#define VIB_FREQ 5000
+#define VIB_RES 8
+
+unsigned long vibTimer = 0;
+int vibStage = 0;
+
+// ===== ESP-NOW =====
+typedef struct struct_message {
+  int command;
+} struct_message;
+
+struct_message myData;
+
+uint8_t receiverMac[] = {0x00, 0x70, 0x07, 0x19, 0x95, 0x28};
+
+unsigned long alertStartTime = 0;
+bool timerStarted = false;
+
+// ===== SEND CALLBACK =====
+void OnDataSent(const wifi_tx_info_t *info, esp_now_send_status_t status) {
+  if (status == ESP_NOW_SEND_SUCCESS)
+    Serial.println("SEND SUCCESS");
+  else
+    Serial.println("SEND FAILED");
+}
+
+void setup() {
+
+  Serial.begin(115200);
+
+  pinMode(IR_PIN, INPUT);
+  pinMode(TOUCH_PIN, INPUT);
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+
+  // PWM setup
+  ledcAttach(VIB_PIN, VIB_FREQ, VIB_RES);
+  ledcWrite(VIB_PIN, 0);
+
+  // MPU setup
+  Wire.begin(5, 6);
+  mpu.initialize();
+
+  // ===== ESP-NOW INIT =====
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW INIT FAILED");
+    return;
+  }
+
+  esp_now_register_send_cb(OnDataSent);
+
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, receiverMac, 6);
+  peerInfo.channel = 1;
+  peerInfo.encrypt = false;
+
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("FAILED TO ADD PEER");
+    return;
+  }
+
+  Serial.println("System Ready");
+}
+
+void loop() {
+
+  // ================= MPU CHECK =================
+  int16_t ax, ay, az;
+  mpu.getAcceleration(&ax, &ay, &az);
+
+  long motion = abs(ax) + abs(ay) + abs(az);
+
+  if (motion > 14000)
+    mpuDrowsy = true;
+  else
+    mpuDrowsy = false;
+
+  // ================= IR CHECK =================
+  int irState = digitalRead(IR_PIN);
+
+  if (irState == LOW) {
+    if (eyeCloseStart == 0)
+      eyeCloseStart = millis();
+
+    if (millis() - eyeCloseStart > 1500)
+      irDrowsy = true;
+  }
+  else {
+    irDrowsy = false;
+    eyeCloseStart = 0;
+  }
+
+  // ================= FINAL ALERT =================
+  bool alertActive = (mpuDrowsy && irDrowsy);
+
+  // ================= RESET =================
+  if (digitalRead(TOUCH_PIN) == HIGH) {
+    alertActive = false;
+    vibStage = 0;
+    timerStarted = false;
+    irDrowsy = false;
+    mpuDrowsy = false;
+    eyeCloseStart = 0;
+    delay(300);
+  }
+
+  if (alertActive) {
+
+    digitalWrite(LED_PIN, HIGH);
+
+    // ===== Escalation every 400ms =====
+    if (millis() - vibTimer > 2000) {
+      vibTimer = millis();
+      if (vibStage < 4)
+        vibStage++;
+    }
+
+    int duty = 0;
+
+    switch (vibStage) {
+      case 1: duty = 60; break;
+      case 2: duty = 180; break;
+      case 3: duty = 240; break;
+      case 4: duty = 255; break;
+    }
+
+    ledcWrite(VIB_PIN, duty);
+
+    // ===== Buzzer =====
+    for(int i = 0; i < 200; i++) {
+      digitalWrite(BUZZER_PIN, HIGH);
+      delayMicroseconds(400);
+      digitalWrite(BUZZER_PIN, LOW);
+      delayMicroseconds(400);
+    }
+
+    // ===== ESP-NOW Send after 1 sec active =====
+    if (!timerStarted) {
+      timerStarted = true;
+      alertStartTime = millis();
+    }
+
+    if (millis() - alertStartTime > 1000) {
+
+      myData.command = 1;
+
+      esp_now_send(receiverMac,
+                   (uint8_t *)&myData,
+                   sizeof(myData));
+
+      Serial.println("DIM SIGNAL SENT");
+
+      timerStarted = false;  // allow repeat if still active
+    }
+
+  } else {
+
+    digitalWrite(LED_PIN, LOW);
+    digitalWrite(BUZZER_PIN, LOW);
+
+    vibStage = 0;
+    ledcWrite(VIB_PIN, 0);
+
+    timerStarted = false;
+  }
+
+  delay(20);
+}
