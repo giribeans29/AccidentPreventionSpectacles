@@ -1,0 +1,139 @@
+#include <Wire.h>
+#include <MPU6050.h>
+#include <esp_now.h>
+#include <WiFi.h>
+#include <esp_wifi.h>
+
+// ===== PIN CONFIG =====
+#define IR_LEFT     10
+#define IR_RIGHT    20
+#define LED_PIN     8
+#define BUZZER_PIN  8  
+
+#define VIB_LEFT    4
+#define VIB_RIGHT   2
+
+MPU6050 mpu;
+
+bool mpuAlert     = false;
+bool irAlert      = false;
+bool alertActive  = false;
+bool espNowSent   = false;
+
+unsigned long eyeCloseStart = 0;
+unsigned long alertStart    = 0;
+bool timerStarted           = false;
+
+typedef struct struct_message {
+  int command;
+} struct_message;
+
+struct_message myData;
+uint8_t receiverMac[] = {0xB0, 0xCB, 0xD8, 0xC9, 0xF9, 0x3C};
+esp_now_peer_info_t peerInfo;
+
+void OnDataSent(const wifi_tx_info_t *info, esp_now_send_status_t status) {
+  Serial.printf("ESP-NOW to %02X:%02X:%02X:%02X:%02X:%02X → %s\n",
+    info->des_addr[0], info->des_addr[1], info->des_addr[2],
+    info->des_addr[3], info->des_addr[4], info->des_addr[5],
+    status == ESP_NOW_SEND_SUCCESS ? "SUCCESS ✅" : "FAILED ❌");
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  pinMode(IR_LEFT,    INPUT);
+  pinMode(IR_RIGHT,   INPUT);
+  pinMode(LED_PIN,    OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+
+  ledcAttach(VIB_LEFT,  5000, 8);
+  ledcAttach(VIB_RIGHT, 5000, 8);
+
+  Wire.begin(6, 5);
+  mpu.initialize();
+  Serial.println(mpu.testConnection() ? "MPU6050 OK ✅" : "MPU6050 FAIL ❌");
+
+  WiFi.disconnect(true);
+  delay(200);
+  WiFi.mode(WIFI_STA);
+  delay(200);
+
+  // Set channel BEFORE esp_now_init()
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_promiscuous(false);
+  delay(100);
+
+  Serial.print("MAC: ");
+  Serial.println(WiFi.macAddress());
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW init FAILED ❌");
+    return;
+  }
+
+  esp_now_register_send_cb(OnDataSent);
+
+  memset(&peerInfo, 0, sizeof(peerInfo));
+  memcpy(peerInfo.peer_addr, receiverMac, 6);
+  peerInfo.channel = 1;
+  peerInfo.encrypt = false;
+
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("Peer add FAILED ❌");
+    return;
+  }
+
+  Serial.println("READY ✅");
+}
+
+void loop() {
+  int16_t ax, ay, az;
+  mpu.getAcceleration(&ax, &ay, &az);
+  mpuAlert = (abs(ay) > 8000);
+
+  int irLeft  = digitalRead(IR_LEFT);
+  int irRight = digitalRead(IR_RIGHT);
+
+  Serial.printf("IR: %d %d | ay: %d | mpu: %d | ir: %d\n",
+                irLeft, irRight, ay, mpuAlert, irAlert);
+
+  if (irLeft == LOW && irRight == LOW) {
+    if (eyeCloseStart == 0) eyeCloseStart = millis();
+    if (millis() - eyeCloseStart > 1500) irAlert = true;
+  } else {
+    irAlert = false;
+    eyeCloseStart = 0;
+  }
+
+// LED on if either alert (visual warning)
+  bool ledOn = (mpuAlert || irAlert);
+  // Buzzer ONLY if both conditions true simultaneously
+  bool buzzerOn = (mpuAlert && irAlert);
+
+  digitalWrite(LED_PIN,    ledOn);
+  digitalWrite(BUZZER_PIN, buzzerOn);
+
+  alertActive = buzzerOn;  // ESP-NOW also only triggers when both active
+
+  if (alertActive) {
+    if (!timerStarted) {
+      alertStart   = millis();
+      timerStarted = true;
+      espNowSent   = false;
+    }
+    if (!espNowSent && millis() - alertStart >= 4000) {
+      myData.command = 1;
+      esp_err_t r = esp_now_send(receiverMac, (uint8_t*)&myData, sizeof(myData));
+      Serial.println(r == ESP_OK ? "Send OK ✅" : "Send ERR ❌");
+      espNowSent = true;
+    }
+  } else {
+    timerStarted = false;
+    espNowSent   = false;
+  }
+
+  delay(50);
+}
